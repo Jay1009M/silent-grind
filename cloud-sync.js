@@ -12,8 +12,8 @@
 // (open the browser console, sign in, confirm rows appear in
 // Table Editor -> kv_store) before relying on it for real data.
 
-const SUPABASE_URL = '';       // e.g. 'https://xxxx.supabase.co'
-const SUPABASE_ANON_KEY = '';  // anon/public key, not the service role key
+const SUPABASE_URL = 'https://xiqrcfavlyquksifrqeo.supabase.co';
+const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InhpcXJjZmF2bHlxdWtzaWZycWVvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODYxODA1MzQsImV4cCI6MjEwMTc1NjUzNH0.uchjhaTCGbbK-ZzlAyyTRC896mj1YeEP9zO4ETkTy4M';
 
 window.SilentGrindCloud = (() => {
   if (!SUPABASE_URL || !SUPABASE_ANON_KEY) return null;
