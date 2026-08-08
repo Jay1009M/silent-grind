@@ -1,0 +1,1037 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+<meta name="theme-color" content="#0A0A0A" />
+<title>Silent Grind</title>
+<link rel="manifest" href="./manifest.json" />
+<link rel="apple-touch-icon" href="./apple-touch-icon.png" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="Silent Grind" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  body { font-family: 'Inter', ui-sans-serif, system-ui, sans-serif; }
+  .serif { font-family: 'Instrument Serif', serif; }
+  ::-webkit-scrollbar { display: none; }
+  input[type="time"]::-webkit-calendar-picker-indicator { filter: invert(1); opacity: 0.6; }
+</style>
+</head>
+<body class="bg-[#0A0A0A] text-[#F5F5F0]">
+<div id="root"></div>
+
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<!-- Optional real backend. Leave cloud-sync.js unconfigured (empty keys)
+     and the app runs exactly as before, local-only. -->
+<script src="https://unpkg.com/@supabase/supabase-js@2"></script>
+<script src="./cloud-sync.js"></script>
+
+<script>
+  if ('serviceWorker' in navigator) {
+    window.addEventListener('load', () => {
+      navigator.serviceWorker.register('./service-worker.js').catch(() => {});
+    });
+  }
+</script>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useRef, useCallback } = React;
+
+/* =========================================================
+   HONEST BUILD NOTES (read before shipping)
+   - Persistence: real localStorage, structured behind storage.get/set
+     so it can be swapped for a real backend (Supabase recommended)
+     without touching component code.
+   - Notifications: real browser Notification API. Session-complete,
+     the 8:30pm nightly nudge, and scheduled auto-start all genuinely
+     fire -- but ONLY while this browser tab is open. True background
+     push requires a service worker + backend, not included here.
+   - Payments: NOT wired. The "Upgrade" modal is a local demo toggle
+     so you can see the gated UI states. Replace checkout() with a
+     real Stripe Checkout session (fastest path for web) before any
+     real user sees this screen.
+   - Circle / Ghost Leaderboard: cut entirely for this version. A
+     social feature with zero real users is worse than no social
+     feature. Rebuild it once you have people to put in it.
+   ========================================================= */
+
+// ---------- STORAGE ----------
+const storage = {
+  get(key) { try { return window.localStorage.getItem(key); } catch { return null; } },
+  set(key, value) { try { window.localStorage.setItem(key, value); } catch {} },
+};
+
+function useLocalStorage(key, initial) {
+  const [value, setValue] = useState(() => {
+    try {
+      const raw = storage.get(key);
+      return raw ? JSON.parse(raw) : initial;
+    } catch { return initial; }
+  });
+  const skipNextCloudWrite = useRef(false);
+
+  // If cloud-sync.js is configured and the user is signed in, pull the
+  // cloud copy on mount / sign-in (cloud is the cross-device source of
+  // truth once you're signed in). If cloud-sync.js isn't configured,
+  // window.SilentGrindCloud is null and this is a no-op — pure local
+  // behavior, unchanged.
+  useEffect(() => {
+    let cancelled = false;
+    async function hydrate() {
+      if (!window.SilentGrindCloud || !window.SilentGrindCloud.getUser()) return;
+      const cloudVal = await window.SilentGrindCloud.get(key);
+      if (!cancelled && cloudVal !== null) {
+        skipNextCloudWrite.current = true;
+        setValue(cloudVal);
+      }
+    }
+    hydrate();
+    const unsub = window.SilentGrindCloud ? window.SilentGrindCloud.onAuthChange(hydrate) : null;
+    return () => { cancelled = true; if (unsub) unsub(); };
+  }, [key]);
+
+  useEffect(() => {
+    try { storage.set(key, JSON.stringify(value)); } catch {}
+    if (skipNextCloudWrite.current) { skipNextCloudWrite.current = false; return; }
+    if (window.SilentGrindCloud && window.SilentGrindCloud.getUser()) {
+      window.SilentGrindCloud.set(key, value);
+    }
+  }, [key, value]);
+
+  return [value, setValue];
+}
+
+function useCloudAuth() {
+  const [user, setUser] = useState(null);
+  const supported = typeof window !== 'undefined' && !!window.SilentGrindCloud;
+  useEffect(() => {
+    if (!window.SilentGrindCloud) return;
+    return window.SilentGrindCloud.onAuthChange(setUser);
+  }, []);
+  return { user, supported };
+}
+
+// ---------- HELPERS ----------
+const uid = () => Math.random().toString(36).slice(2, 9) + Date.now().toString(36).slice(-4);
+const todayStr = () => new Date().toISOString().slice(0, 10);
+const fmtDate = (iso) => new Date(iso).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+const fmtClock = (sec) => {
+  const m = Math.floor(sec / 60).toString().padStart(2, '0');
+  const s = Math.floor(sec % 60).toString().padStart(2, '0');
+  return `${m}:${s}`;
+};
+const daysSince = (iso) => Math.max(0, Math.floor((Date.now() - new Date(iso).getTime()) / 86400000));
+
+// ---------- ICONS (hand-built, no external icon lib) ----------
+function Icon({ name, className = "w-4 h-4", strokeWidth = 2 }) {
+  const c = { viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth, strokeLinecap: "round", strokeLinejoin: "round", className };
+  switch (name) {
+    case 'lock': return <svg {...c}><rect x="4" y="11" width="16" height="9" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>;
+    case 'plus': return <svg {...c}><path d="M12 5v14M5 12h14"/></svg>;
+    case 'x': return <svg {...c}><path d="M18 6 6 18M6 6l12 12"/></svg>;
+    case 'check': return <svg {...c}><path d="M20 6 9 17l-5-5"/></svg>;
+    case 'chevronDown': return <svg {...c}><path d="M6 9l6 6 6-6"/></svg>;
+    case 'chevronUp': return <svg {...c}><path d="M18 15l-6-6-6 6"/></svg>;
+    case 'play': return <svg viewBox="0 0 24 24" fill="currentColor" className={className}><path d="M8 5v14l11-7z"/></svg>;
+    case 'pause': return <svg viewBox="0 0 24 24" fill="currentColor" className={className}><rect x="6" y="5" width="4" height="14"/><rect x="14" y="5" width="4" height="14"/></svg>;
+    case 'square': return <svg {...c}><rect x="5" y="5" width="14" height="14" rx="1"/></svg>;
+    case 'clock': return <svg {...c}><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/></svg>;
+    case 'shield': return <svg {...c}><path d="M12 3l7 3v6c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6z"/></svg>;
+    case 'sparkles': return <svg {...c}><path d="M12 3v4M12 17v4M3 12h4M17 12h4M5.6 5.6l2.8 2.8M15.6 15.6l2.8 2.8M18.4 5.6l-2.8 2.8M8.4 15.6l-2.8 2.8"/></svg>;
+    case 'crown': return <svg {...c}><path d="M3 8l4 4 5-7 5 7 4-4-2 10H5z"/></svg>;
+    case 'download': return <svg {...c}><path d="M12 3v12M7 10l5 5 5-5M4 21h16"/></svg>;
+    case 'upload': return <svg {...c}><path d="M12 21V9M7 14l5-5 5 5M4 3h16"/></svg>;
+    case 'more': return <svg viewBox="0 0 24 24" fill="currentColor" className={className}><circle cx="5" cy="12" r="1.5"/><circle cx="12" cy="12" r="1.5"/><circle cx="19" cy="12" r="1.5"/></svg>;
+    case 'timer': return <svg {...c}><circle cx="12" cy="13" r="8"/><path d="M12 9v4l2.5 2.5M9 2h6"/></svg>;
+    case 'image': return <svg {...c}><rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="10" r="1.5"/><path d="M21 16l-5-5-4 4-3-3-5 5"/></svg>;
+    case 'bell': return <svg {...c}><path d="M6 9a6 6 0 0 1 12 0c0 5 2 6 2 6H4s2-1 2-6"/><path d="M10 20a2 2 0 0 0 4 0"/></svg>;
+    case 'bellOff': return <svg {...c}><path d="M6 9a6 6 0 0 1 10.4-4M18 9c0 5 2 6 2 6H8"/><path d="M4 4l16 16"/><path d="M10 20a2 2 0 0 0 4 0"/></svg>;
+    case 'trash': return <svg {...c}><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/></svg>;
+    case 'cloud': return <svg {...c}><path d="M7 18a4 4 0 0 1 .4-7.98A5.5 5.5 0 0 1 18 11.5 3.5 3.5 0 0 1 17.5 18H7z"/></svg>;
+    default: return null;
+  }
+}
+
+// ---------- DOMAIN HOOKS ----------
+function useGoals() {
+  const [goals, setGoals] = useLocalStorage('sg_goals_v1', []);
+  const addGoal = useCallback((title) => {
+    const g = { id: uid(), title: title.trim(), createdAt: new Date().toISOString(), subtasks: [] };
+    setGoals(prev => [g, ...prev]);
+    return g.id;
+  }, [setGoals]);
+  const deleteGoal = useCallback((id) => setGoals(prev => prev.filter(g => g.id !== id)), [setGoals]);
+  const addSubtask = useCallback((goalId, title) => {
+    const st = { id: uid(), title: title.trim(), completed: false, createdAt: new Date().toISOString() };
+    setGoals(prev => prev.map(g => g.id === goalId ? { ...g, subtasks: [...g.subtasks, st] } : g));
+    return st.id;
+  }, [setGoals]);
+  const toggleSubtask = useCallback((goalId, id) => {
+    setGoals(prev => prev.map(g => g.id === goalId ? { ...g, subtasks: g.subtasks.map(s => s.id === id ? { ...s, completed: !s.completed } : s) } : g));
+  }, [setGoals]);
+  const editSubtask = useCallback((goalId, id, title) => {
+    setGoals(prev => prev.map(g => g.id === goalId ? { ...g, subtasks: g.subtasks.map(s => s.id === id ? { ...s, title } : s) } : g));
+  }, [setGoals]);
+  const deleteSubtask = useCallback((goalId, id) => {
+    setGoals(prev => prev.map(g => g.id === goalId ? { ...g, subtasks: g.subtasks.filter(s => s.id !== id) } : g));
+  }, [setGoals]);
+  return { goals, addGoal, deleteGoal, addSubtask, toggleSubtask, editSubtask, deleteSubtask };
+}
+
+function useProofs() {
+  const [proofs, setProofs] = useLocalStorage('sg_proofs_v1', []);
+  const addProof = useCallback((p) => {
+    const proof = { id: uid(), createdAt: new Date().toISOString(), ...p };
+    setProofs(prev => [proof, ...prev]);
+    return proof;
+  }, [setProofs]);
+  const deleteProof = useCallback((id) => setProofs(prev => prev.filter(p => p.id !== id)), [setProofs]);
+  return { proofs, addProof, deleteProof };
+}
+
+function useReflections() {
+  const [reflections, setReflections] = useLocalStorage('sg_reflections_v1', []);
+  const addReflection = useCallback((text) => {
+    setReflections(prev => [{ id: uid(), text, createdAt: new Date().toISOString() }, ...prev]);
+  }, [setReflections]);
+  return { reflections, addReflection };
+}
+
+function useFocusTimer(notify) {
+  const [sessions, setSessions] = useLocalStorage('sg_sessions_v1', []);
+  const [streak, setStreak] = useLocalStorage('sg_streak_v1', 0);
+  const [active, setActive] = useState(null);
+  const [timeLeft, setTimeLeft] = useState(0);
+  const [isRunning, setIsRunning] = useState(false);
+  const intervalRef = useRef(null);
+
+  useEffect(() => {
+    if (!isRunning || !active) return;
+    intervalRef.current = window.setInterval(() => {
+      setTimeLeft(prev => {
+        if (prev <= 1) {
+          const completed = { ...active, durationActual: active.durationPlanned, completedAt: new Date().toISOString(), status: 'completed' };
+          setSessions(s => [completed, ...s]);
+          setStreak(v => v + 1);
+          setIsRunning(false);
+          setActive(null);
+          if (notify) notify('Silent session complete', `${completed.durationActual}m logged. No one saw it.`);
+          if (intervalRef.current) clearInterval(intervalRef.current);
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+    return () => { if (intervalRef.current) clearInterval(intervalRef.current); };
+  }, [isRunning, active, setSessions, setStreak, notify]);
+
+  const startSession = useCallback((goalId, subtaskId, minutes) => {
+    setActive({ id: uid(), goalId, subtaskId, durationPlanned: minutes, durationActual: 0, startedAt: new Date().toISOString() });
+    setTimeLeft(minutes * 60);
+    setIsRunning(true);
+  }, []);
+
+  const pause = useCallback(() => setIsRunning(v => !v), []);
+
+  // Fixed vs. earlier drafts: a stopped-early session with real minutes
+  // still counts toward totals. Only sessions under 1 real minute are dropped.
+  const stop = useCallback(() => {
+    if (!active) return;
+    const elapsedSec = active.durationPlanned * 60 - timeLeft;
+    const elapsedMin = Math.round(elapsedSec / 60);
+    if (elapsedMin >= 1) {
+      setSessions(s => [{ ...active, durationActual: elapsedMin, completedAt: new Date().toISOString(), status: 'aborted' }, ...s]);
+    }
+    setIsRunning(false);
+    setActive(null);
+    setTimeLeft(0);
+    if (intervalRef.current) clearInterval(intervalRef.current);
+  }, [active, timeLeft, setSessions]);
+
+  const totalMinutes = sessions.reduce((a, b) => a + (b.durationActual || 0), 0);
+  const totalHours = +(totalMinutes / 60).toFixed(1);
+
+  return { sessions, active, timeLeft, isRunning, startSession, pause, stop, totalMinutes, totalHours, streak };
+}
+
+function useAudit(sessions, proofs, streak, totalMinutes, totalHours) {
+  const proofsCount = proofs.length;
+  const now = Date.now();
+  const sessionsThisWeek = sessions.filter(s => (now - new Date(s.startedAt).getTime()) / 86400000 <= 7).length;
+  const avgSession = sessions.length ? Math.round(totalMinutes / sessions.length) : 0;
+  const enoughData = proofsCount >= 3 || totalMinutes >= 60;
+  return { totalFocusMinutes: totalMinutes, totalFocusHours: totalHours, proofsCount, streak, sessionsThisWeek, avgSession, enoughData };
+}
+
+// Notifications only fire while this tab is open — no service worker here.
+function useNotifications() {
+  const [settings, setSettings] = useLocalStorage('sg_settings_v1', { notifications: false, isPremiumDemo: false, lastNudgeDate: '' });
+  const supported = typeof window !== 'undefined' && 'Notification' in window;
+
+  const requestPermission = useCallback(async () => {
+    if (!supported) return;
+    try {
+      const perm = await Notification.requestPermission();
+      setSettings(s => ({ ...s, notifications: perm === 'granted' }));
+    } catch {}
+  }, [supported, setSettings]);
+
+  const disable = useCallback(() => setSettings(s => ({ ...s, notifications: false })), [setSettings]);
+
+  const notify = useCallback((title, body) => {
+    if (!supported || Notification.permission !== 'granted') return;
+    try { new Notification(title, { body }); } catch {}
+  }, [supported]);
+
+  useEffect(() => {
+    if (!settings.notifications) return;
+    const id = setInterval(() => {
+      const now = new Date();
+      const today = now.toISOString().slice(0, 10);
+      if (now.getHours() === 20 && now.getMinutes() === 30 && settings.lastNudgeDate !== today) {
+        notify('Silent Grind', 'What did you do today that no one saw?');
+        setSettings(s => ({ ...s, lastNudgeDate: today }));
+      }
+    }, 30000);
+    return () => clearInterval(id);
+  }, [settings.notifications, settings.lastNudgeDate, notify, setSettings]);
+
+  return { settings, setSettings, supported, requestPermission, disable, notify };
+}
+
+// ---------- BACKUP (real, local) ----------
+function exportData() {
+  const data = {
+    version: 1,
+    exportedAt: new Date().toISOString(),
+    goals: JSON.parse(storage.get('sg_goals_v1') || '[]'),
+    proofs: JSON.parse(storage.get('sg_proofs_v1') || '[]'),
+    reflections: JSON.parse(storage.get('sg_reflections_v1') || '[]'),
+    sessions: JSON.parse(storage.get('sg_sessions_v1') || '[]'),
+    streak: JSON.parse(storage.get('sg_streak_v1') || '0'),
+    settings: JSON.parse(storage.get('sg_settings_v1') || '{}'),
+  };
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = `silent-grind-backup-${Date.now()}.json`; a.click();
+  URL.revokeObjectURL(url);
+}
+function importData(file, onDone) {
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    try {
+      const data = JSON.parse(e.target.result);
+      if (data.goals) storage.set('sg_goals_v1', JSON.stringify(data.goals));
+      if (data.proofs) storage.set('sg_proofs_v1', JSON.stringify(data.proofs));
+      if (data.reflections) storage.set('sg_reflections_v1', JSON.stringify(data.reflections));
+      if (data.sessions) storage.set('sg_sessions_v1', JSON.stringify(data.sessions));
+      if (typeof data.streak !== 'undefined') storage.set('sg_streak_v1', JSON.stringify(data.streak));
+      if (data.settings) storage.set('sg_settings_v1', JSON.stringify(data.settings));
+      onDone(true);
+    } catch { onDone(false); }
+  };
+  reader.readAsText(file);
+}
+
+// ---------- CANVAS EXPORT HELPERS ----------
+function wrapText(ctx, text, maxWidth) {
+  const words = text.split(' ');
+  const lines = [];
+  let cur = '';
+  words.forEach(w => {
+    const test = cur + w + ' ';
+    if (ctx.measureText(test).width > maxWidth && cur) { lines.push(cur.trim()); cur = w + ' '; }
+    else cur = test;
+  });
+  if (cur) lines.push(cur.trim());
+  return lines;
+}
+
+const QUOTES = [
+  "Silence is the real flex.",
+  "Build in silence. Let results make the noise.",
+  "No announcement. Just receipts.",
+  "Talk less. Prove more.",
+  "Protect the vision. Ship it quiet.",
+];
+
+const FREE_GOAL_LIMIT = 3;
+const FREE_PROOF_LIMIT = 10;
+
+// ---------- MAIN APP ----------
+function App() {
+  const [activeTab, setActiveTab] = useState('vault');
+  const { settings, setSettings, supported: notifSupported, requestPermission, disable: disableNotifs, notify } = useNotifications();
+  const { goals, addGoal, deleteGoal, addSubtask, toggleSubtask, editSubtask, deleteSubtask } = useGoals();
+  const { proofs, addProof, deleteProof } = useProofs();
+  const { reflections, addReflection } = useReflections();
+  const focus = useFocusTimer(notify);
+  const audit = useAudit(focus.sessions, proofs, focus.streak, focus.totalMinutes, focus.totalHours);
+
+  const isPremium = settings.isPremiumDemo;
+  const { user: cloudUser, supported: cloudSupported } = useCloudAuth();
+  const [showSignIn, setShowSignIn] = useState(false);
+  const [signInEmail, setSignInEmail] = useState('');
+  const [signInSent, setSignInSent] = useState(false);
+
+  // ----- selection state -----
+  const [selectedGoalId, setSelectedGoalId] = useState(null);
+  const [selectedSubtaskId, setSelectedSubtaskId] = useState(null);
+  useEffect(() => {
+    if (goals.length && !goals.find(g => g.id === selectedGoalId)) {
+      setSelectedGoalId(goals[0].id);
+      setSelectedSubtaskId(goals[0].subtasks[0]?.id || null);
+    }
+  }, [goals, selectedGoalId]);
+
+  // ----- focus form -----
+  const [duration, setDuration] = useState(25);
+  const [whenOption, setWhenOption] = useState('now');
+  const [scheduledTime, setScheduledTime] = useState('09:00');
+  const [showAdvanced, setShowAdvanced] = useState(false);
+  const [scheduled, setScheduled] = useState(null);
+
+  useEffect(() => {
+    if (!scheduled) return;
+    const id = setInterval(() => {
+      if (Date.now() >= new Date(scheduled.at).getTime() && !focus.active) {
+        focus.startSession(scheduled.goalId, scheduled.subtaskId, scheduled.minutes);
+        notify('Scheduled session started', 'Your silent block just began.');
+        setScheduled(null);
+      }
+    }, 15000);
+    return () => clearInterval(id);
+  }, [scheduled, focus.active, focus, notify]);
+
+  const flatSubtasks = goals.flatMap(g => g.subtasks.filter(s => !s.completed).map(s => ({ g, s })));
+  const selectedGoal = goals.find(g => g.id === selectedGoalId);
+  const selectedSubtask = selectedGoal?.subtasks.find(s => s.id === selectedSubtaskId);
+
+  const handleStartFocus = () => {
+    if (!selectedGoalId || !selectedSubtaskId) return;
+    if (whenOption === 'schedule') {
+      const [h, m] = scheduledTime.split(':').map(Number);
+      const at = new Date();
+      at.setHours(h, m, 0, 0);
+      if (at.getTime() < Date.now()) at.setDate(at.getDate() + 1);
+      setScheduled({ goalId: selectedGoalId, subtaskId: selectedSubtaskId, minutes: duration, at: at.toISOString() });
+      return;
+    }
+    focus.startSession(selectedGoalId, selectedSubtaskId, duration);
+  };
+
+  // ----- modals -----
+  const [showGoalModal, setShowGoalModal] = useState(false);
+  const [newGoalTitle, setNewGoalTitle] = useState('');
+  const [newSubtaskInputs, setNewSubtaskInputs] = useState({});
+  const [openMenu, setOpenMenu] = useState(null);
+  const [editingSubtask, setEditingSubtask] = useState(null);
+  const [showProofModal, setShowProofModal] = useState(false);
+  const [proofText, setProofText] = useState('');
+  const [proofGoalId, setProofGoalId] = useState('');
+  const [proofSubtaskId, setProofSubtaskId] = useState('');
+  const [showUpgrade, setShowUpgrade] = useState(false);
+  const [importMsg, setImportMsg] = useState(null);
+  const fileInputRef = useRef(null);
+
+  const handleLockGoal = () => {
+    if (!newGoalTitle.trim()) return;
+    if (!isPremium && goals.length >= FREE_GOAL_LIMIT) { setShowGoalModal(false); setShowUpgrade(true); return; }
+    const id = addGoal(newGoalTitle);
+    setNewGoalTitle(''); setShowGoalModal(false); setSelectedGoalId(id);
+  };
+  const openAddProof = (goalId, subtaskId) => {
+    if (!isPremium && proofs.length >= FREE_PROOF_LIMIT) { setShowUpgrade(true); return; }
+    setProofGoalId(goalId || ''); setProofSubtaskId(subtaskId || ''); setShowProofModal(true);
+  };
+  const handleAddProof = () => {
+    if (!proofText.trim() || !proofGoalId) return;
+    addProof({ goalId: proofGoalId, subtaskId: proofSubtaskId, text: proofText.trim() });
+    setProofText(''); setShowProofModal(false);
+  };
+
+  // ----- reveal export -----
+  const canvasRef = useRef(null);
+  const [memeBg, setMemeBg] = useState('dark');
+  const [memeQuote, setMemeQuote] = useState(0);
+
+  const exportMeme = () => {
+    const canvas = canvasRef.current; if (!canvas) return;
+    const ctx = canvas.getContext('2d'); if (!ctx) return;
+    const W = 1080, H = 1350;
+    canvas.width = W; canvas.height = H;
+    if (memeBg === 'sunset') {
+      const g = ctx.createLinearGradient(0, 0, 0, H);
+      g.addColorStop(0, '#FF6B35'); g.addColorStop(0.5, '#F7931E'); g.addColorStop(1, '#FFD60A');
+      ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+    } else if (memeBg === 'city') {
+      ctx.fillStyle = '#0A0A0A'; ctx.fillRect(0, 0, W, H);
+      ctx.fillStyle = '#1A1A1A';
+      for (let i = 0; i < 12; i++) ctx.fillRect(i * 90 + 10, H - 400 - Math.random() * 200, 70, 400 + Math.random() * 200);
+    } else {
+      ctx.fillStyle = '#0A0A0A'; ctx.fillRect(0, 0, W, H);
+    }
+    ctx.fillStyle = memeBg === 'sunset' ? '#0A0A0A' : '#F5F5F0';
+    ctx.font = 'italic 700 76px "Instrument Serif", serif';
+    ctx.textAlign = 'center';
+    const lines = wrapText(ctx, `"${QUOTES[memeQuote]}"`, W * 0.8);
+    let y = H / 2 - (lines.length * 90) / 2;
+    lines.forEach(line => { ctx.fillText(line, W / 2, y); y += 96; });
+    ctx.font = '600 28px Inter, sans-serif';
+    ctx.fillStyle = memeBg === 'sunset' ? 'rgba(10,10,10,0.7)' : 'rgba(245,245,240,0.6)';
+    ctx.fillText(`${focus.totalHours}h silent • real, not generic`, W / 2, H - 80);
+    const url = canvas.toDataURL('image/png');
+    const a = document.createElement('a'); a.href = url; a.download = `silentgrind-meme-${Date.now()}.png`; a.click();
+  };
+
+  const exportResults = () => {
+    const canvas = canvasRef.current; if (!canvas) return;
+    const ctx = canvas.getContext('2d'); if (!ctx) return;
+    canvas.width = 1080; canvas.height = 1080;
+    ctx.fillStyle = '#0A0A0A'; ctx.fillRect(0, 0, 1080, 1080);
+    ctx.fillStyle = '#F5F5F0'; ctx.textAlign = 'center';
+    ctx.font = '700 64px "Instrument Serif", serif';
+    ctx.fillText(`${focus.totalHours}h silent`, 540, 480);
+    ctx.font = '400 22px Inter, sans-serif';
+    ctx.fillStyle = 'rgba(245,245,240,0.55)';
+    ctx.fillText(`${proofs.length} proofs • ${focus.streak}d streak • computed from real sessions`, 540, 540);
+    const url = canvas.toDataURL('image/png');
+    const a = document.createElement('a'); a.href = url; a.download = `silentgrind-results-${Date.now()}.png`; a.click();
+  };
+
+  const checkout = () => {
+    // DEMO ONLY. No payment is collected. Replace with a real Stripe
+    // Checkout session (web) or RevenueCat/StoreKit (native) before
+    // this screen is shown to a real user.
+    setSettings(s => ({ ...s, isPremiumDemo: true }));
+    setShowUpgrade(false);
+  };
+
+  const NAV = [
+    { id: 'vault', label: 'Vault', icon: 'lock' },
+    { id: 'focus', label: 'Focus', icon: 'timer' },
+    { id: 'proofs', label: 'Proofs', icon: 'shield' },
+    { id: 'reveal', label: 'Reveal', icon: 'sparkles' },
+  ];
+
+  return (
+    <div className="min-h-screen bg-[#0A0A0A] text-[#F5F5F0] selection:bg-[#FFD60A] selection:text-black">
+      {/* HEADER */}
+      <header className="sticky top-0 z-30 border-b border-white/[0.08] bg-[#0A0A0A]/85 backdrop-blur-xl">
+        <div className="mx-auto max-w-5xl flex items-center justify-between px-4 md:px-8 h-[56px]">
+          <div className="flex items-center gap-2.5">
+            <div className="w-7 h-7 rounded-[8px] bg-[#FFD60A] flex items-center justify-center">
+              <Icon name="lock" className="w-4 h-4 text-black" />
+            </div>
+            <span className="font-semibold tracking-tight text-[14px]">SILENT GRIND</span>
+          </div>
+          <div className="flex items-center gap-1.5">
+            {cloudSupported && (
+              <button
+                aria-label={cloudUser ? 'Cloud sync on — click to sign out' : 'Sign in for cloud sync'}
+                title={cloudUser ? `Synced as ${cloudUser.email}` : 'Sign in for cloud sync'}
+                onClick={() => cloudUser ? window.SilentGrindCloud.signOut() : setShowSignIn(true)}
+                className={`w-8 h-8 rounded-full flex items-center justify-center border ${cloudUser ? 'bg-emerald-400/20 text-emerald-300 border-emerald-400/30' : 'bg-white/[0.06] border-white/10 text-white/60'}`}
+              >
+                <Icon name="cloud" className="w-3.5 h-3.5" />
+              </button>
+            )}
+            <button
+              aria-label={settings.notifications ? 'Disable reminders' : 'Enable reminders'}
+              title={settings.notifications ? 'Reminders on (this tab only)' : 'Enable reminders'}
+              onClick={() => settings.notifications ? disableNotifs() : requestPermission()}
+              className={`w-8 h-8 rounded-full flex items-center justify-center border ${settings.notifications ? 'bg-[#FFD60A] text-black border-[#FFD60A]' : 'bg-white/[0.06] border-white/10 text-white/60'}`}
+            >
+              <Icon name={settings.notifications ? 'bell' : 'bellOff'} className="w-3.5 h-3.5" />
+            </button>
+            <button aria-label="Export backup" title="Export backup (JSON)" onClick={exportData} className="w-8 h-8 rounded-full bg-white/[0.06] border border-white/10 text-white/60 flex items-center justify-center">
+              <Icon name="download" className="w-3.5 h-3.5" />
+            </button>
+            <button aria-label="Import backup" title="Import backup (JSON)" onClick={() => fileInputRef.current?.click()} className="w-8 h-8 rounded-full bg-white/[0.06] border border-white/10 text-white/60 flex items-center justify-center">
+              <Icon name="upload" className="w-3.5 h-3.5" />
+            </button>
+            <input ref={fileInputRef} type="file" accept="application/json" className="hidden" onChange={(e) => {
+              const f = e.target.files?.[0]; if (!f) return;
+              importData(f, (ok) => setImportMsg(ok ? 'Imported. Reloading...' : 'Import failed — invalid file.'));
+              if (fileInputRef.current) fileInputRef.current.value = '';
+            }} />
+            <button
+              aria-label="Upgrade"
+              onClick={() => setShowUpgrade(true)}
+              className={`h-8 rounded-full px-3 text-[12px] font-semibold flex items-center gap-1.5 border ${isPremium ? 'bg-[#FFD60A] text-black border-[#FFD60A]' : 'bg-white/[0.06] border-white/10 text-white/80'}`}
+            >
+              <Icon name="crown" className="w-3.5 h-3.5" /> {isPremium ? 'PRO (demo)' : 'Upgrade'}
+            </button>
+          </div>
+        </div>
+        {/* nav */}
+        <div className="mx-auto max-w-5xl px-4 md:px-8 pb-2.5">
+          <div className="flex items-center gap-1 p-1 rounded-full bg-white/[0.06] border border-white/[0.06] w-fit">
+            {NAV.map(t => (
+              <button key={t.id} onClick={() => setActiveTab(t.id)}
+                className={`h-8 rounded-full px-3.5 text-[12.5px] font-medium flex items-center gap-1.5 transition-all ${activeTab === t.id ? 'bg-white text-black' : 'text-white/60 hover:text-white'}`}>
+                <Icon name={t.icon} className="w-3.5 h-3.5" /> {t.label}
+              </button>
+            ))}
+          </div>
+        </div>
+      </header>
+
+      <div className="mx-auto max-w-5xl px-4 md:px-8 py-6 pb-16">
+
+        {/* ---------------- VAULT ---------------- */}
+        {activeTab === 'vault' && (
+          <div>
+            {goals.length === 0 ? (
+              <div className="min-h-[55vh] flex flex-col items-center justify-center text-center px-6">
+                <div className="w-16 h-16 rounded-[20px] bg-white/[0.06] border border-white/10 flex items-center justify-center mb-6">
+                  <Icon name="lock" className="w-7 h-7 text-white/40" />
+                </div>
+                <h1 className="serif text-[36px] md:text-[52px] leading-[0.95] tracking-tight mb-3">Your vault is empty.<br/>Silence starts here.</h1>
+                <p className="text-white/40 text-[14px] max-w-[360px] leading-relaxed mb-8">No seeded goals. No fake activity. Lock your first real goal — stored only in this browser.</p>
+                <button onClick={() => setShowGoalModal(true)} className="h-[48px] rounded-full bg-[#FFD60A] text-black px-7 font-semibold text-[14px] flex items-center gap-2 hover:brightness-110">
+                  <Icon name="plus" className="w-4 h-4" /> Lock First Goal
+                </button>
+              </div>
+            ) : (
+              <div className="grid md:grid-cols-[300px_1fr] gap-6 items-start">
+                <div className="space-y-3">
+                  <div className="flex items-center justify-between">
+                    <h2 className="text-[11px] tracking-[0.14em] text-white/30 font-semibold">GOALS • {goals.length}{!isPremium ? `/${FREE_GOAL_LIMIT}` : ''}</h2>
+                    <button aria-label="Add goal" onClick={() => setShowGoalModal(true)} className="w-7 h-7 rounded-full bg-white/[0.08] flex items-center justify-center hover:bg-white/[0.14]">
+                      <Icon name="plus" className="w-4 h-4" />
+                    </button>
+                  </div>
+                  {goals.map(g => {
+                    const done = g.subtasks.filter(s => s.completed).length;
+                    const pct = g.subtasks.length ? Math.round(done / g.subtasks.length * 100) : 0;
+                    return (
+                      <button key={g.id} onClick={() => { setSelectedGoalId(g.id); setSelectedSubtaskId(g.subtasks[0]?.id || null); }}
+                        className={`w-full text-left rounded-[16px] border p-4 transition ${selectedGoalId === g.id ? 'bg-white text-black border-white' : 'bg-white/[0.04] border-white/[0.08] hover:bg-white/[0.06]'}`}>
+                        <p className={`font-medium leading-snug text-[14px] ${selectedGoalId === g.id ? 'text-black' : 'text-white'}`}>{g.title}</p>
+                        <div className="mt-2 flex items-center gap-2">
+                          <div className={`flex-1 h-1.5 rounded-full overflow-hidden ${selectedGoalId === g.id ? 'bg-black/10' : 'bg-black/40'}`}>
+                            <div className="h-full bg-[#FFD60A]" style={{ width: `${pct}%` }} />
+                          </div>
+                          <span className="text-[11px] opacity-60">{pct}%</span>
+                        </div>
+                        <div className="mt-2 flex items-center gap-1.5 text-[11px] opacity-50"><Icon name="clock" className="w-3 h-3" /> {daysSince(g.createdAt)}d silent</div>
+                      </button>
+                    );
+                  })}
+
+                  <div className="rounded-[16px] border border-white/[0.08] bg-white/[0.03] p-4 mt-6">
+                    <h3 className="text-[11px] tracking-widest text-white/30 font-semibold mb-3">WEEKLY AUDIT • REAL DATA</h3>
+                    {!audit.enoughData ? (
+                      <p className="text-[13px] leading-relaxed text-white/50">Not enough data yet — log 3 proofs or 60 real minutes. No fabricated numbers.</p>
+                    ) : (
+                      <div className="space-y-2 text-[13px]">
+                        <div className="flex justify-between"><span className="text-white/40">Focus</span><span className="font-medium">{audit.totalFocusMinutes}m • {audit.totalFocusHours}h</span></div>
+                        <div className="flex justify-between"><span className="text-white/40">Proofs</span><span className="font-medium">{audit.proofsCount}</span></div>
+                        <div className="flex justify-between"><span className="text-white/40">Streak</span><span className="font-medium">{audit.streak} days</span></div>
+                        <div className="flex justify-between"><span className="text-white/40">Sessions (7d)</span><span className="font-medium">{audit.sessionsThisWeek}</span></div>
+                        <div className="flex justify-between"><span className="text-white/40">Avg session</span><span className="font-medium">{audit.avgSession}m</span></div>
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                <div className="rounded-[24px] border border-white/[0.08] bg-[#111111] p-5 md:p-7 min-h-[400px]">
+                  {!selectedGoal ? <p className="text-white/30 text-[14px]">Select a goal</p> : (
+                    <>
+                      <div className="flex items-start justify-between gap-4 mb-6">
+                        <div>
+                          <h2 className="serif text-[26px] leading-tight">{selectedGoal.title}</h2>
+                          <p className="text-[12px] text-white/30 mt-1">Stored only in this browser.</p>
+                        </div>
+                        <button aria-label="Delete goal" onClick={() => deleteGoal(selectedGoal.id)} className="text-white/20 hover:text-white/60"><Icon name="x" className="w-4 h-4" /></button>
+                      </div>
+                      <div className="space-y-2">
+                        {selectedGoal.subtasks.map(st => (
+                          <div key={st.id} className="relative rounded-[14px] bg-white/[0.05] border border-white/[0.06] p-3.5 flex items-center gap-3">
+                            <button aria-label={st.completed ? 'Mark incomplete' : 'Mark complete'} onClick={() => toggleSubtask(selectedGoal.id, st.id)}
+                              className={`w-6 h-6 rounded-full border flex items-center justify-center shrink-0 ${st.completed ? 'bg-[#FFD60A] border-[#FFD60A] text-black' : 'border-white/20'}`}>
+                              {st.completed && <Icon name="check" className="w-3.5 h-3.5" />}
+                            </button>
+                            {editingSubtask?.id === st.id ? (
+                              <input autoFocus value={editingSubtask.title}
+                                onChange={e => setEditingSubtask({ ...editingSubtask, title: e.target.value })}
+                                onBlur={() => { editSubtask(selectedGoal.id, st.id, editingSubtask.title); setEditingSubtask(null); }}
+                                onKeyDown={e => { if (e.key === 'Enter') { editSubtask(selectedGoal.id, st.id, editingSubtask.title); setEditingSubtask(null); } }}
+                                className="flex-1 bg-transparent outline-none text-[14px]" />
+                            ) : (
+                              <span className={`flex-1 text-[14px] leading-snug ${st.completed ? 'line-through text-white/30' : 'text-white/90'}`}>{st.title}</span>
+                            )}
+                            {/* always-visible, touch-first controls */}
+                            <div className="flex items-center gap-1">
+                              <button onClick={() => { setSelectedGoalId(selectedGoal.id); setSelectedSubtaskId(st.id); setActiveTab('focus'); }}
+                                className="h-7 px-2.5 rounded-full bg-white text-black text-[11px] font-semibold flex items-center gap-1">
+                                <Icon name="play" className="w-3 h-3" /> Focus
+                              </button>
+                              <div className="relative">
+                                <button aria-label="More actions" onClick={() => setOpenMenu(openMenu === st.id ? null : st.id)} className="w-7 h-7 rounded-full bg-white/[0.08] flex items-center justify-center">
+                                  <Icon name="more" className="w-4 h-4" />
+                                </button>
+                                {openMenu === st.id && (
+                                  <div className="absolute right-0 top-8 z-10 w-[160px] rounded-[12px] border border-white/10 bg-[#1E1E1E] p-1 shadow-xl">
+                                    <button onClick={() => { setEditingSubtask({ id: st.id, title: st.title }); setOpenMenu(null); }} className="w-full text-left px-3 py-2 rounded-[8px] text-[13px] hover:bg-white/[0.08]">Edit</button>
+                                    <button onClick={() => { openAddProof(selectedGoal.id, st.id); setOpenMenu(null); }} className="w-full text-left px-3 py-2 rounded-[8px] text-[13px] hover:bg-white/[0.08]">Add proof</button>
+                                    <button onClick={() => { deleteSubtask(selectedGoal.id, st.id); setOpenMenu(null); }} className="w-full text-left px-3 py-2 rounded-[8px] text-[13px] text-red-400 hover:bg-white/[0.08]">Delete</button>
+                                  </div>
+                                )}
+                              </div>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                      <div className="mt-4 flex gap-2">
+                        <input value={newSubtaskInputs[selectedGoal.id] || ''} onChange={e => setNewSubtaskInputs({ ...newSubtaskInputs, [selectedGoal.id]: e.target.value })}
+                          onKeyDown={e => { if (e.key === 'Enter') { const t = newSubtaskInputs[selectedGoal.id]; if (t?.trim()) { addSubtask(selectedGoal.id, t); setNewSubtaskInputs({ ...newSubtaskInputs, [selectedGoal.id]: '' }); } } }}
+                          placeholder="Add silent step..." className="flex-1 h-[42px] rounded-full bg-white/[0.06] border border-white/[0.08] px-4 text-[13px] outline-none placeholder:text-white/20 focus:border-[#FFD60A]/40" />
+                        <button onClick={() => { const t = newSubtaskInputs[selectedGoal.id]; if (t?.trim()) { addSubtask(selectedGoal.id, t); setNewSubtaskInputs({ ...newSubtaskInputs, [selectedGoal.id]: '' }); } }}
+                          className="h-[42px] rounded-full bg-white text-black px-5 text-[13px] font-semibold">Add</button>
+                      </div>
+                    </>
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ---------------- FOCUS ---------------- */}
+        {activeTab === 'focus' && (
+          <div className="max-w-[680px] mx-auto">
+            {focus.active ? (
+              <div className="rounded-[32px] border border-white/[0.08] bg-[#111111] p-8 md:p-12 text-center">
+                <p className="text-[11px] tracking-[0.2em] text-white/30 mb-6">SILENT SESSION</p>
+                <div className="serif text-[72px] md:text-[110px] leading-none tracking-tighter tabular-nums">{fmtClock(focus.timeLeft)}</div>
+                <p className="serif italic text-[17px] text-white/50 mt-3">{goals.flatMap(g => g.subtasks).find(s => s.id === focus.active.subtaskId)?.title}</p>
+                <div className="mt-10 flex items-center justify-center gap-3">
+                  <button onClick={focus.pause} className="w-14 h-14 rounded-full bg-white text-black flex items-center justify-center">
+                    <Icon name={focus.isRunning ? 'pause' : 'play'} className="w-5 h-5" />
+                  </button>
+                  <button onClick={focus.stop} className="w-14 h-14 rounded-full bg-white/[0.08] border border-white/10 flex items-center justify-center">
+                    <Icon name="square" className="w-4 h-4" />
+                  </button>
+                </div>
+                <p className="mt-8 text-[11px] text-white/25">Private to you. No one sees this.</p>
+              </div>
+            ) : (
+              <div className="rounded-[24px] border border-white/[0.08] bg-[#111111] p-6 md:p-8">
+                <div className="flex items-center justify-between mb-6">
+                  <h2 className="serif text-[24px]">Focus</h2>
+                  <span className="text-[11px] tracking-widest text-white/30">1-TAP • {duration}M</span>
+                </div>
+                {scheduled && (
+                  <div className="mb-5 rounded-xl bg-[#FFD60A]/10 border border-[#FFD60A]/20 px-4 py-3 flex items-center justify-between gap-3">
+                    <span className="text-[12px] text-[#FFD60A]">Scheduled for {new Date(scheduled.at).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}. Fires only if this tab stays open.</span>
+                    <button onClick={() => setScheduled(null)} className="text-[11px] underline text-white/50">Cancel</button>
+                  </div>
+                )}
+                {goals.length === 0 ? (
+                  <div className="py-10 text-center">
+                    <p className="text-white/40 text-[14px] mb-4">No goals yet. Lock one first.</p>
+                    <button onClick={() => setActiveTab('vault')} className="h-10 rounded-full bg-white text-black px-5 text-[13px] font-semibold">Go to Vault</button>
+                  </div>
+                ) : (
+                  <>
+                    <div className="space-y-2.5 mb-6 max-h-[260px] overflow-auto pr-1">
+                      {flatSubtasks.length === 0 && <p className="text-white/30 text-[13px]">No open steps — add one in Vault.</p>}
+                      {flatSubtasks.map(({ g, s }) => (
+                        <button key={s.id} onClick={() => { setSelectedGoalId(g.id); setSelectedSubtaskId(s.id); }}
+                          className={`w-full text-left rounded-[14px] border p-3.5 flex items-center justify-between ${selectedSubtaskId === s.id ? 'bg-[#FFD60A] border-[#FFD60A] text-black' : 'bg-white/[0.04] border-white/[0.08] text-white/80'}`}>
+                          <div>
+                            <p className="text-[13px] font-medium leading-tight">{s.title}</p>
+                            <p className={`text-[11px] mt-0.5 ${selectedSubtaskId === s.id ? 'text-black/60' : 'text-white/30'}`}>{g.title}</p>
+                          </div>
+                          {selectedSubtaskId === s.id && <div className="w-5 h-5 rounded-full bg-black text-[#FFD60A] flex items-center justify-center"><Icon name="check" className="w-3 h-3" /></div>}
+                        </button>
+                      ))}
+                    </div>
+                    <button onClick={handleStartFocus} disabled={!selectedSubtask}
+                      className="w-full h-[60px] rounded-[20px] bg-[#FFD60A] text-black font-semibold text-[15px] flex items-center justify-center gap-3 disabled:opacity-30 disabled:cursor-not-allowed hover:brightness-110 transition">
+                      <div className="w-9 h-9 rounded-full bg-black text-[#FFD60A] flex items-center justify-center"><Icon name="play" className="w-4 h-4" /></div>
+                      {whenOption === 'now' ? `Start ${duration}m Now` : `Schedule for ${scheduledTime}`}
+                    </button>
+                    <button onClick={() => setShowAdvanced(!showAdvanced)} className="mt-4 w-full h-[38px] rounded-full bg-white/[0.06] border border-white/[0.08] text-[13px] flex items-center justify-center gap-1.5">
+                      Advanced <Icon name={showAdvanced ? 'chevronUp' : 'chevronDown'} className="w-4 h-4" />
+                    </button>
+                    {showAdvanced && (
+                      <div className="mt-4 grid grid-cols-1 md:grid-cols-2 gap-4 p-4 rounded-[16px] bg-white/[0.04] border border-white/[0.06]">
+                        <div>
+                          <p className="text-[11px] tracking-widest text-white/30 mb-2">WHEN</p>
+                          <div className="flex gap-2">
+                            <button onClick={() => setWhenOption('now')} className={`flex-1 h-9 rounded-full text-[12px] font-medium border ${whenOption === 'now' ? 'bg-white text-black border-white' : 'bg-transparent border-white/10 text-white/60'}`}>Now</button>
+                            <button onClick={() => setWhenOption('schedule')} className={`flex-1 h-9 rounded-full text-[12px] font-medium border ${whenOption === 'schedule' ? 'bg-white text-black border-white' : 'bg-transparent border-white/10 text-white/60'}`}>Schedule</button>
+                          </div>
+                          {whenOption === 'schedule' && <input type="time" value={scheduledTime} onChange={e => setScheduledTime(e.target.value)} className="mt-2 w-full h-9 rounded-full bg-black border border-white/10 px-3 text-[13px]" />}
+                        </div>
+                        <div>
+                          <p className="text-[11px] tracking-widest text-white/30 mb-2">DURATION</p>
+                          <div className="grid grid-cols-4 gap-2">
+                            {[15, 25, 45, 60].map(m => (
+                              <button key={m} onClick={() => setDuration(m)} className={`h-9 rounded-full text-[12px] font-medium border ${duration === m ? 'bg-[#FFD60A] border-[#FFD60A] text-black' : 'border-white/10 text-white/60'}`}>{m}m</button>
+                            ))}
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                  </>
+                )}
+              </div>
+            )}
+            {focus.sessions.length > 0 && !focus.active && (
+              <div className="mt-6 rounded-[16px] border border-white/[0.06] bg-white/[0.03] p-4">
+                <p className="text-[11px] tracking-widest text-white/30 mb-3">RECENT SESSIONS • REAL</p>
+                <div className="space-y-2">
+                  {focus.sessions.slice(0, 5).map(s => (
+                    <div key={s.id} className="flex items-center justify-between text-[13px]">
+                      <span className="text-white/60 truncate max-w-[240px]">{goals.find(g => g.id === s.goalId)?.title || 'Deleted goal'}</span>
+                      <span className="text-white/30">{s.durationActual}m • {s.status}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ---------------- PROOFS ---------------- */}
+        {activeTab === 'proofs' && (
+          <div className="max-w-[680px] mx-auto">
+            <div className="flex items-center justify-between mb-6">
+              <h2 className="serif text-[26px]">Proof Locker</h2>
+              <button onClick={() => openAddProof(goals[0]?.id, '')} className="h-9 rounded-full bg-white text-black px-4 text-[13px] font-semibold flex items-center gap-1.5">
+                <Icon name="plus" className="w-4 h-4" /> Add win
+              </button>
+            </div>
+            <div className="rounded-[16px] border border-white/10 bg-[#FFD60A]/10 px-4 py-3 flex items-start gap-2 mb-6">
+              <Icon name="shield" className="w-4 h-4 text-[#FFD60A] mt-0.5 shrink-0" />
+              <p className="text-[12px] leading-relaxed text-[#FFD60A]/80">Stored only in this browser. Not encrypted, not synced, not shared. Use Export to back it up.</p>
+            </div>
+            {proofs.length === 0 ? (
+              <div className="rounded-[24px] border border-dashed border-white/15 p-10 text-center"><p className="text-white/30 text-[14px]">No proofs yet.</p></div>
+            ) : (
+              <div className="space-y-3">
+                {proofs.map(p => {
+                  const g = goals.find(gg => gg.id === p.goalId);
+                  const st = g?.subtasks.find(s => s.id === p.subtaskId);
+                  return (
+                    <div key={p.id} className="rounded-[16px] border border-white/[0.08] bg-[#111111] p-4 flex items-start justify-between gap-3">
+                      <div className="flex-1">
+                        <p className="text-[14px] leading-relaxed text-white/90">{p.text}</p>
+                        <div className="mt-2 flex flex-wrap items-center gap-2 text-[11px] text-white/30">
+                          <span className="px-2 py-0.5 rounded-full bg-white/[0.06] border border-white/10">{g?.title || 'Goal'}</span>
+                          {st && <span>{st.title}</span>}
+                          <span>{fmtDate(p.createdAt)}</span>
+                        </div>
+                      </div>
+                      <button aria-label="Delete proof" onClick={() => deleteProof(p.id)} className="w-7 h-7 rounded-full bg-white/[0.06] flex items-center justify-center text-white/30 hover:text-white"><Icon name="x" className="w-3.5 h-3.5" /></button>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+            <div className="mt-8 rounded-[16px] bg-white/[0.04] border border-white/[0.06] p-4">
+              <p className="text-[11px] tracking-widest text-white/30 mb-2">REFLECTIONS</p>
+              <div className="flex gap-2">
+                <input id="reflectInput" placeholder="Quiet reflection..." className="flex-1 h-10 rounded-full bg-black border border-white/10 px-4 text-[13px] outline-none"
+                  onKeyDown={e => { const el = e.target; if (e.key === 'Enter' && el.value.trim()) { addReflection(el.value); el.value = ''; } }} />
+                <button onClick={() => { const el = document.getElementById('reflectInput'); if (el?.value.trim()) { addReflection(el.value); el.value = ''; } }} className="h-10 rounded-full bg-white text-black px-4 text-[13px] font-semibold">Add</button>
+              </div>
+              <div className="mt-3 space-y-2">
+                {reflections.slice(0, 6).map(r => <p key={r.id} className="text-[13px] text-white/50 leading-relaxed">• {r.text} <span className="text-white/20">— {fmtDate(r.createdAt)}</span></p>)}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* ---------------- REVEAL ---------------- */}
+        {activeTab === 'reveal' && (
+          <div className="max-w-[680px] mx-auto space-y-6">
+            <div className={`rounded-[24px] border p-6 md:p-8 ${proofs.length >= 3 ? 'bg-white text-black border-white' : 'bg-[#111111] border-white/[0.08] opacity-80'}`}>
+              <div className="flex items-center justify-between mb-4">
+                <h2 className="serif text-[22px]">Results Card</h2>
+                <span className={`text-[11px] px-2.5 py-1 rounded-full border ${proofs.length >= 3 ? 'border-black/15 text-black/60' : 'border-white/10 text-white/30'}`}>{proofs.length >= 3 ? `${focus.totalHours}h PROOF` : 'LOCKED'}</span>
+              </div>
+              {proofs.length < 3 ? (
+                <div className="py-8 text-center">
+                  <div className="w-12 h-12 rounded-full bg-white/[0.06] mx-auto flex items-center justify-center mb-3"><Icon name="lock" className="w-5 h-5 text-white/30" /></div>
+                  <p className="text-[14px] text-white/50">Complete 3 silent wins to unlock.</p>
+                  <p className="text-[12px] text-white/25 mt-1">Real hours only — no card generated from nothing.</p>
+                  <button onClick={() => setActiveTab('proofs')} className="mt-4 h-9 rounded-full bg-white text-black px-4 text-[13px] font-semibold">Add proof</button>
+                </div>
+              ) : (
+                <div>
+                  <div className="rounded-[16px] bg-[#0A0A0A] text-white p-6 border border-black/10">
+                    <p className="serif italic text-[20px] leading-tight">"{QUOTES[memeQuote]}"</p>
+                    <div className="mt-6 flex items-center justify-between">
+                      <div><p className="text-[11px] tracking-widest text-white/30">SILENT HOURS</p><p className="text-[26px] font-semibold tracking-tight">{focus.totalHours}h • {proofs.length} proofs</p></div>
+                      <div className="text-right"><p className="text-[11px] text-white/30">STREAK</p><p className="text-[15px] font-medium">{focus.streak} days</p></div>
+                    </div>
+                  </div>
+                  <button onClick={exportResults} className="mt-4 w-full h-[44px] rounded-full bg-black text-white text-[13px] font-semibold flex items-center justify-center gap-2"><Icon name="download" className="w-4 h-4" /> Export Results</button>
+                </div>
+              )}
+            </div>
+
+            <div className="rounded-[24px] border border-white/[0.08] bg-[#111111] p-6 md:p-8">
+              <div className="flex items-center justify-between mb-5">
+                <h3 className="text-[15px] font-semibold flex items-center gap-2"><Icon name="image" className="w-4 h-4" /> Meme Drop</h3>
+                <span className="text-[10px] px-2 py-1 rounded-full bg-emerald-400/15 text-emerald-300 border border-emerald-400/20">FREE</span>
+              </div>
+              {focus.sessions.length === 0 ? (
+                <div className="py-6 text-center">
+                  <p className="text-[13px] text-white/40">Complete one focus session first — so this isn't a "0h silent" watermark.</p>
+                  <button onClick={() => setActiveTab('focus')} className="mt-3 h-9 rounded-full bg-white text-black px-4 text-[13px] font-semibold">Go to Focus</button>
+                </div>
+              ) : (
+                <>
+                  <div className="grid grid-cols-3 gap-2 mb-5">
+                    {['sunset', 'city', 'dark'].map(bg => (
+                      <button key={bg} onClick={() => setMemeBg(bg)}
+                        className={`h-20 rounded-[14px] border text-[11px] font-medium capitalize ${memeBg === bg ? 'border-[#FFD60A] ring-2 ring-[#FFD60A]/30' : 'border-white/10'} ${bg === 'sunset' ? 'bg-gradient-to-br from-orange-400 to-yellow-300 text-black' : 'bg-black text-white'}`}>{bg}</button>
+                    ))}
+                  </div>
+                  <div className="flex gap-2 overflow-auto pb-2 mb-5">
+                    {QUOTES.map((q, i) => (
+                      <button key={i} onClick={() => setMemeQuote(i)} className={`shrink-0 px-3 py-2 rounded-full text-[12px] border ${memeQuote === i ? 'bg-white text-black border-white' : 'bg-white/[0.06] border-white/10 text-white/60'}`}>{q.slice(0, 22)}...</button>
+                    ))}
+                  </div>
+                  <div className="rounded-[20px] overflow-hidden border border-white/10 bg-black relative aspect-[4/5] flex items-center justify-center p-8 text-center"
+                    style={{ background: memeBg === 'sunset' ? 'linear-gradient(135deg,#FF6B35,#FFD60A)' : '#0A0A0A' }}>
+                    <div>
+                      <p className={`serif italic text-[28px] leading-[0.95] ${memeBg === 'sunset' ? 'text-black' : 'text-[#F5F5F0]'}`}>&ldquo;{QUOTES[memeQuote]}&rdquo;</p>
+                      <p className={`mt-6 text-[11px] font-semibold tracking-widest ${memeBg === 'sunset' ? 'text-black/60' : 'text-white/40'}`}>{focus.totalHours}h silent • real</p>
+                    </div>
+                  </div>
+                  <button onClick={exportMeme} className="mt-4 w-full h-11 rounded-full bg-white text-black text-[13px] font-semibold flex items-center justify-center gap-2"><Icon name="download" className="w-4 h-4" /> Export PNG</button>
+                </>
+              )}
+              <canvas ref={canvasRef} className="hidden" />
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* GOAL MODAL */}
+      {showGoalModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm">
+          <div className="w-full max-w-[440px] rounded-[24px] bg-[#141414] border border-white/10 p-6">
+            <div className="flex items-center justify-between mb-5">
+              <h3 className="serif text-[22px]">Lock a goal</h3>
+              <button aria-label="Close" onClick={() => setShowGoalModal(false)} className="w-8 h-8 rounded-full bg-white/10 flex items-center justify-center"><Icon name="x" className="w-4 h-4" /></button>
+            </div>
+            <input autoFocus value={newGoalTitle} onChange={e => setNewGoalTitle(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') handleLockGoal(); }}
+              placeholder="e.g. Ship silent product" className="w-full h-[48px] rounded-full bg-black border border-white/15 px-5 text-[14px] outline-none focus:border-[#FFD60A]/50" />
+            {!isPremium && <p className="text-[11px] text-white/30 mt-3">{goals.length}/{FREE_GOAL_LIMIT} free goals used.</p>}
+            <div className="mt-6 flex gap-2">
+              <button onClick={() => setShowGoalModal(false)} className="flex-1 h-11 rounded-full bg-white/[0.08] text-[13px]">Cancel</button>
+              <button onClick={handleLockGoal} className="flex-1 h-11 rounded-full bg-[#FFD60A] text-black text-[13px] font-semibold">Lock Goal</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* PROOF MODAL */}
+      {showProofModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm">
+          <div className="w-full max-w-[480px] rounded-[24px] bg-[#141414] border border-white/10 p-6">
+            <div className="flex items-center justify-between mb-5">
+              <h3 className="serif text-[22px]">Add silent win</h3>
+              <button aria-label="Close" onClick={() => setShowProofModal(false)} className="w-8 h-8 rounded-full bg-white/10 flex items-center justify-center"><Icon name="x" className="w-4 h-4" /></button>
+            </div>
+            <div className="grid grid-cols-2 gap-2 mb-3">
+              <select value={proofGoalId} onChange={e => { setProofGoalId(e.target.value); setProofSubtaskId(''); }} className="h-10 rounded-full bg-black border border-white/15 px-3 text-[13px]">
+                <option value="">Select goal</option>
+                {goals.map(g => <option key={g.id} value={g.id}>{g.title}</option>)}
+              </select>
+              <select value={proofSubtaskId} onChange={e => setProofSubtaskId(e.target.value)} className="h-10 rounded-full bg-black border border-white/15 px-3 text-[13px]">
+                <option value="">Select step (optional)</option>
+                {goals.find(g => g.id === proofGoalId)?.subtasks.map(s => <option key={s.id} value={s.id}>{s.title}</option>)}
+              </select>
+            </div>
+            <textarea value={proofText} onChange={e => setProofText(e.target.value)} placeholder="What did you ship in silence?"
+              className="w-full min-h-[96px] rounded-[16px] bg-black border border-white/15 p-4 text-[14px] outline-none focus:border-[#FFD60A]/50 resize-none" />
+            {!isPremium && <p className="text-[11px] text-white/30 mt-2">{proofs.length}/{FREE_PROOF_LIMIT} free proofs used.</p>}
+            <div className="mt-5 flex gap-2">
+              <button onClick={() => setShowProofModal(false)} className="flex-1 h-11 rounded-full bg-white/[0.08] text-[13px]">Cancel</button>
+              <button onClick={handleAddProof} className="flex-1 h-11 rounded-full bg-white text-black text-[13px] font-semibold">Save proof</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* UPGRADE MODAL */}
+      {showUpgrade && (
+        <div className="fixed inset-0 z-50 flex items-end md:items-center justify-center p-0 md:p-4 bg-black/80 backdrop-blur-sm">
+          <div className="w-full md:max-w-[420px] rounded-t-[28px] md:rounded-[28px] bg-[#111111] border border-white/10 p-7">
+            <div className="flex items-center justify-between mb-6">
+              <div className="flex items-center gap-2"><Icon name="crown" className="w-5 h-5 text-[#FFD60A]" /><h3 className="serif text-[22px]">Silent Grind Pro</h3></div>
+              <button aria-label="Close" onClick={() => setShowUpgrade(false)} className="w-8 h-8 rounded-full bg-white/10 flex items-center justify-center"><Icon name="x" className="w-4 h-4" /></button>
+            </div>
+            <div className="space-y-2 mb-5 text-[13px] text-white/70">
+              <p>Unlimited goals (free: {FREE_GOAL_LIMIT})</p>
+              <p>Unlimited proofs (free: {FREE_PROOF_LIMIT})</p>
+            </div>
+            <button onClick={checkout} className="w-full h-[52px] rounded-full bg-[#FFD60A] text-black font-semibold text-[14px]">{isPremium ? 'Already unlocked (demo)' : 'Unlock (demo — no payment)'}</button>
+            <div className="mt-4 rounded-[12px] bg-white/[0.04] border border-white/10 p-3 text-[11px] text-white/40 leading-relaxed">
+              This is a local demo toggle for testing gated UI. No payment is collected. Before real users see this screen, replace it with a real Stripe Checkout session (web) or RevenueCat/StoreKit (native).
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* CLOUD SIGN-IN MODAL */}
+      {showSignIn && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm">
+          <div className="w-full max-w-[380px] rounded-[24px] bg-[#141414] border border-white/10 p-6">
+            <div className="flex items-center justify-between mb-5">
+              <h3 className="serif text-[20px]">Sign in for cloud sync</h3>
+              <button aria-label="Close" onClick={() => { setShowSignIn(false); setSignInSent(false); }} className="w-8 h-8 rounded-full bg-white/10 flex items-center justify-center"><Icon name="x" className="w-4 h-4" /></button>
+            </div>
+            {signInSent ? (
+              <p className="text-[13px] text-white/60 leading-relaxed">Check your email for a magic link. Come back to this tab after clicking it.</p>
+            ) : (
+              <>
+                <input type="email" value={signInEmail} onChange={e => setSignInEmail(e.target.value)} placeholder="you@example.com"
+                  className="w-full h-[46px] rounded-full bg-black border border-white/15 px-5 text-[14px] outline-none focus:border-[#FFD60A]/50" />
+                <button
+                  onClick={async () => {
+                    if (!signInEmail.trim() || !window.SilentGrindCloud) return;
+                    await window.SilentGrindCloud.signIn(signInEmail.trim());
+                    setSignInSent(true);
+                  }}
+                  className="mt-4 w-full h-[46px] rounded-full bg-[#FFD60A] text-black font-semibold text-[13px]"
+                >
+                  Send magic link
+                </button>
+              </>
+            )}
+            <p className="mt-4 text-[11px] text-white/25 leading-relaxed">No password. Your data still lives in this browser too — signing in just adds a synced copy in your own Supabase project.</p>
+          </div>
+        </div>
+      )}
+
+      {/* IMPORT TOAST */}
+      {importMsg && (
+        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-[60]">
+          <div className="bg-white text-black text-[13px] font-medium px-4 py-2.5 rounded-full shadow-xl">{importMsg}</div>
+          {(() => { setTimeout(() => { setImportMsg(null); if (importMsg.startsWith('Imported')) window.location.reload(); }, 1200); return null; })()}
+        </div>
+      )}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>
