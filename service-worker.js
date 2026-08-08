@@ -11,7 +11,7 @@
 //   The in-app Notification calls in silent-grind.html still only fire
 //   while that tab/app is open, same as before.
 
-const CACHE_NAME = 'silent-grind-v1';
+const CACHE_NAME = 'silent-grind-v2';
 const APP_SHELL = [
   './index.html',
   './manifest.json',
